@@ -1,0 +1,21 @@
+{
+    "timeout": 5,
+    "typoThreshold": 0.45,
+    "baakWebsite": "https://baak.wicida.ac.id/",
+    "siakWebsite": "https://siak.wicida.ac.id/",
+    "workingHours": {
+        "start": 8,
+        "end": 16,
+        "breakStart": 12,
+        "breakEnd": 14,
+        "workDays": [1, 2, 3, 4, 5]
+    },
+    "admins": [
+        {
+            "id": "admin1",
+            "name": "Admin BAAK 1",
+            "jid": "6285157514800@s.whatsapp.net"
+        }
+    ],
+    "adminNotifyPrefix": "ADMIN"
+}
