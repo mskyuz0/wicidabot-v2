@@ -30,7 +30,7 @@ export function closingMessage(client: any, sender: string): void {
 export function notFoundMessage(client: any, sender: string): void {
     client.sendMessage(sender, {
         text:
-            `Hmm, sepertinya saya belum memiliki informasi tentang itu. 🤔\n\n` +
+            `Sepertinya saya belum memiliki informasi tentang itu. 🤔\n\n` +
             `Kamu bisa coba:\n` +
             `• Menanyakan dengan kata lain\n` +
             `• Ketik *hubungi admin* untuk terhubung langsung dengan staf BAAK`,
@@ -168,7 +168,6 @@ export function notifyAdminChatEnded(
     const userPhone = userJid.replace('@s.whatsapp.net', '')
     client.sendMessage(adminJid, {
         text:
-            `ℹ️ *[WICIDA BOT]*\n\n` +
             `Sesi chat dengan *+${userPhone}* telah berakhir.\n` +
             `Kamu sekarang tersedia untuk melayani pengguna lain.`,
     })
