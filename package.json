@@ -1,17 +1,19 @@
 {
   "name": "wbot",
   "version": "1.0.0",
-  "description": "",
+  "description": "WhatsApp Bot using Baileys",
   "keywords": [
     "bot",
     "whatsapp"
   ],
   "license": "ISC",
   "author": "KyuZ0",
-  "type": "commonjs",
-  "main": "index.js",
+  "type": "module",
+  "main": "dist/main.js",
   "scripts": {
-    "dev": "tsc && node dist/main",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsc && node dist/main.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
