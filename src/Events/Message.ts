@@ -8,10 +8,10 @@
  */
 
 import { WASocket } from 'baileys'
-import * as Config from '../../config.json'
-import { loadKnowledgeBase, keywordIndex } from '../Utils/knowledgeBase'
-import { resetTimeout, userSessions } from '../Utils/sessionManager'
-import { matchKeyword } from '../Utils/typoHandle'
+import Config from '../../config.json' with { type: 'json' }
+import { loadKnowledgeBase, keywordIndex } from '../Utils/knowledgeBase.js'
+import { resetTimeout, userSessions } from '../Utils/sessionManager.js'
+import { matchKeyword } from '../Utils/typoHandle.js'
 import {
     initAdminQueue,
     isWorkingHours,
@@ -27,13 +27,13 @@ import {
     startAdminChat,
     endAdminChat,
     dequeueNext,
-} from '../Utils/adminQueue'
-import * as T from '../Utils/textFunction'
+} from '../Utils/adminQueue.js'
+import * as T from '../Utils/textFunction.js'
 
 // ─── Inisialisasi ─────────────────────────────────────────────────────────────
 
-loadKnowledgeBase()
-initAdminQueue()
+await loadKnowledgeBase()
+await initAdminQueue()
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
@@ -136,7 +136,7 @@ function processNextQueue(client: WASocket): void {
 
 // ─── Handler Utama ────────────────────────────────────────────────────────────
 
-module.exports = {
+export default {
     name: 'messages.upsert',
 
     async execute(client: WASocket, connectWhatsApp: () => Promise<void>, res: any) {

@@ -1,6 +1,6 @@
-import * as Config from '../../config.json'
+import Config from '../../config.json' with { type: 'json' }
 
-module.exports = {
+export default {
     keywords: ["validasi krs", "verifikasi krs", "valid krs", "cetak krs"],
     async execute(WhatsAppClient: any, sender: any){
         await WhatsAppClient.sendMessage(sender, { text: `Untuk validasi atau cetak KRS, kamu bisa ikuti prosedur dibawah ini:

@@ -1,7 +1,7 @@
 import type { WASocket, WACallEvent } from "baileys";
 
-module.exports = {
-    name: 'call',
+export default {
+name: 'call',
     async execute(sock: WASocket, ConnectWhatsApp: () => Promise<void>, calls: WACallEvent[]) {
         for (const call of calls) {
             if (call.status !== "offer") continue;

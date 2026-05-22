@@ -1,7 +1,7 @@
 import type { WASocket, GroupMetadata } from "baileys";
-import { antiGroups } from '../Utils/textFunction'
+import { antiGroups } from '../Utils/textFunction.js'
 
-module.exports = {
+export default {
     name: 'groups.upsert',
     async execute(sock: WASocket, ConnectWhatsApp: () => Promise<void>, groups: GroupMetadata[]) {
         for (const group of groups) {

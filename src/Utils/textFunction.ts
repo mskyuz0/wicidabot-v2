@@ -3,7 +3,7 @@
  * Kumpulan semua teks/pesan yang dikirimkan bot ke user maupun admin.
  */
 
-import { AdminConfig } from './adminQueue'
+import { AdminConfig } from './adminQueue.js'
 
 // ─── Pesan Umum Bot ───────────────────────────────────────────────────────────
 

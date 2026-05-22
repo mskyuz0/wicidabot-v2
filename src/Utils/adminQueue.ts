@@ -4,7 +4,7 @@
  * status ketersediaan admin, dan sesi chat admin-user.
  */
 
-import * as Config from '../../config.json'
+import Config from '../../config.json' with { type: 'json' }
 
 // ─── Tipe Data ───────────────────────────────────────────────────────────────
 

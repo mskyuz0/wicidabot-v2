@@ -1,9 +1,10 @@
-import * as Config from '../../config.json'
+import Config from '../../config.json' with { type: 'json' }
 
-module.exports = {
+export default {
     keywords: ["sertifikat akreditasi", "akreditasi"],
-    async execute(WhatsAppClient: any, sender: any){
-        await WhatsAppClient.sendMessage(sender, { text: `Untuk Sertifikat Akreditasi, kamu bisa ikuti prosedur dibawah ini:
+    async execute(WhatsAppClient: any, sender: any) {
+        await WhatsAppClient.sendMessage(sender, {
+            text: `Untuk Sertifikat Akreditasi, kamu bisa ikuti prosedur dibawah ini:
 
 1. Kunjugi website BAAK WICIDA (${Config.baakWebsite}).
 2. Pilih *Info Pelayanan* pada bilah navigasi.

@@ -3,8 +3,8 @@
  * Mengelola sesi percakapan user dengan bot (timeout, dll).
  */
 
-import * as Config from '../../config.json'
-import * as thisText from './textFunction'
+import Config from '../../config.json' with { type: 'json' }
+import * as thisText from './textFunction.js'
 
 export interface UserSession {
     active: boolean

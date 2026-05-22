@@ -1,9 +1,10 @@
-import * as Config from '../../config.json'
+import Config from '../../config.json' with { type: 'json' }
 
-module.exports = {
+export default {
     keywords: ["surat aktif", "surat keterangan aktif"],
-    async execute(WhatsAppClient: any, sender: any){
-        await WhatsAppClient.sendMessage(sender, { text: `Surat Keterangan Aktif Kuliah adalah surat pernyataan yang dikeluarkan oleh STMIK Widya Cipta Dharma kepada Mahasiswa, yang menerangkan status Mahasiswa yang bersangkutan masih aktif dan terdaftar disemester tersebut.
+    async execute(WhatsAppClient: any, sender: any) {
+        await WhatsAppClient.sendMessage(sender, {
+            text: `Surat Keterangan Aktif Kuliah adalah surat pernyataan yang dikeluarkan oleh STMIK Widya Cipta Dharma kepada Mahasiswa, yang menerangkan status Mahasiswa yang bersangkutan masih aktif dan terdaftar disemester tersebut.
             
 *Prosedur Surat Aktif Kuliah:*
 

@@ -6,7 +6,7 @@ import {
 import * as QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
 
-module.exports = {
+export default {
     name: 'connection.update',
     async execute(baileysSock: WASocket, ConnectWhatsApp: () => Promise<void>, update: Partial<ConnectionState>) {
         const { connection, lastDisconnect, qr } = update;
