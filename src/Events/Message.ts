@@ -10,7 +10,7 @@
 import { WASocket } from 'baileys'
 import Config from '../../config.json' with { type: 'json' }
 import { loadKnowledgeBase, keywordIndex } from '../Utils/knowledgeBase.js'
-import { resetTimeout, userSessions } from '../Utils/sessionManager.js'
+import { clearSession, resetTimeout, userSessions } from '../Utils/sessionManager.js'
 import { matchKeyword } from '../Utils/typoHandle.js'
 import {
     initAdminQueue,
@@ -25,6 +25,8 @@ import {
     getAdminChatByUser,
     getUserByAdminJid,
     startAdminChat,
+    acceptAdminChat,
+    isAdminChatAccepted,
     endAdminChat,
     dequeueNext,
 } from '../Utils/adminQueue.js'
@@ -52,6 +54,10 @@ function normalizeText(text: string): string {
  */
 function normalizeJid(jid: string): string {
     return jid.replace(/:\d+@/, '@')
+}
+
+function extractNumber(jid: string): string {
+    return jid.split('@')[0].replace(/:\d+$/, '')
 }
 
 /** Cek apakah JID ini adalah salah satu admin yang terdaftar */
@@ -82,7 +88,13 @@ async function handleContactAdmin(client: WASocket, sender: string): Promise<voi
         T.alreadyInQueueMessage(client, sender, pos)
         return
     }
-
+ 
+    // Kirim pesan "mencari admin..." terlebih dahulu
+    await T.searchingAdminMessage(client, sender)
+ 
+    // Jeda 2 detik agar terasa natural
+    await new Promise(resolve => setTimeout(resolve, 2000))
+ 
     const availableAdmin = getAvailableAdmin()
     if (availableAdmin) {
         startAdminChat(sender, availableAdmin)
@@ -99,7 +111,7 @@ async function handleContactAdmin(client: WASocket, sender: string): Promise<voi
 /** Tangani perintah "selesai" dari user atau admin */
 async function handleEndSession(client: WASocket, sender: string): Promise<void> {
     const normalizedSender = normalizeJid(sender)
-
+ 
     if (isAdminJid(normalizedSender)) {
         const userJid = getUserByAdminJid(normalizedSender)
         if (!userJid) {
@@ -107,18 +119,22 @@ async function handleEndSession(client: WASocket, sender: string): Promise<void>
             return
         }
         endAdminChat(userJid)
+        // Akhiri sesi bot user sekaligus
+        clearSession(userJid)
         T.adminChatEndedUserMessage(client, userJid)
         T.notifyAdminChatEnded(client, sender, userJid)
         processNextQueue(client)
         return
     }
-
+ 
     const session = getAdminChatByUser(sender)
     if (!session) {
         client.sendMessage(sender, { text: `Kamu tidak sedang dalam sesi chat dengan admin.` })
         return
     }
     endAdminChat(sender)
+    // Akhiri sesi bot user sekaligus
+    clearSession(sender)
     T.adminChatEndedUserMessage(client, sender)
     T.notifyAdminChatEnded(client, session.adminJid, sender)
     processNextQueue(client)
@@ -142,9 +158,14 @@ export default {
     async execute(client: WASocket, connectWhatsApp: () => Promise<void>, res: any) {
         const message = res.messages[0]
         const isMsg = message?.message
-        if (!isMsg || message.key.fromMe) return
+        const isKey = message.key
+        if (!isMsg || isKey.fromMe) return
 
-        const sender: string = message.key.remoteJidAlt
+        if (isKey) {
+            await client.readMessages([isKey])
+        }
+
+        const sender: string = isKey.remoteJidAlt
         if (!sender) return
 
         const rawText = (
@@ -166,11 +187,11 @@ export default {
         if (isAdminJid(normalizedSender)) {
             const adminConfig = getAdminConfigByJid(normalizedSender)
             const userJid = getUserByAdminJid(normalizedSender)
-
+ 
             console.log(`[Admin] Pesan dari ${adminConfig?.name ?? normalizedSender}, sesi user: ${userJid ?? '-'}`)
-
+ 
             if (!adminConfig) return  // config tidak ditemukan, abaikan
-
+ 
             // Admin tidak sedang menangani siapapun
             if (!userJid) {
                 client.sendMessage(sender, {
@@ -181,14 +202,23 @@ export default {
                 })
                 return
             }
-
+ 
             // Admin sedang menangani user — cek perintah
             if (normalizedText === 'selesai') {
                 await handleEndSession(client, sender)
                 return
             }
             if (normalizedText === 'tolak') {
+                // Hanya bisa tolak jika sesi belum diterima (admin belum balas pertama kali)
+                if (isAdminChatAccepted(userJid)) {
+                    client.sendMessage(sender, {
+                        text: `⚠️ Tidak bisa menolak sesi yang sudah berjalan.
+Ketik *selesai* untuk mengakhiri sesi.`,
+                    })
+                    return
+                }
                 endAdminChat(userJid)
+                clearSession(userJid)
                 client.sendMessage(userJid, {
                     text: `Maaf, admin tidak bisa meladeni kamu saat ini. Ketik *hubungi admin* untuk masuk antrian kembali.`,
                 })
@@ -196,16 +226,21 @@ export default {
                 processNextQueue(client)
                 return
             }
-
+ 
+            // Pesan pertama dari admin = tanda sesi diterima
+            if (!isAdminChatAccepted(userJid)) {
+                acceptAdminChat(userJid)
+            }
+ 
             // Relay pesan admin → user
             T.relayToUser(client, userJid, adminConfig.name, rawText)
             return
         }
-
+ 
         // ═══════════════════════════════════════════════════════════════════
         // BLOK 2: Pengirim adalah User
         // ═══════════════════════════════════════════════════════════════════
-
+ 
         // Inisialisasi sesi baru untuk user yang belum pernah chat
         if (!userSessions[sender]) {
             userSessions[sender] = { active: true }
@@ -213,9 +248,9 @@ export default {
             resetTimeout(sender, client)
             return
         }
-
+ 
         resetTimeout(sender, client)
-
+ 
         // User sedang dalam sesi chat dengan admin → relay
         if (isInAdminChat(sender)) {
             const session = getAdminChatByUser(sender)!
@@ -226,9 +261,9 @@ export default {
             T.relayToAdmin(client, session.adminJid, sender, rawText)
             return
         }
-
+ 
         // ── Perintah Khusus User ────────────────────────────────────────────
-
+ 
         // "hubungi admin"
         const contactAdminPatterns = ['hubungi admin', 'admin baak', 'tanya admin', 'bicara admin', 'chat admin']
         const wantAdmin =
@@ -238,7 +273,7 @@ export default {
             await handleContactAdmin(client, sender)
             return
         }
-
+ 
         // "batalkan antrian"
         const cancelPatterns = ['batalkan', 'batal antrian', 'cancel antrian', 'keluar antrian']
         const wantCancel = cancelPatterns.some(p => normalizedText.includes(p))
@@ -251,18 +286,18 @@ export default {
             }
             return
         }
-
+ 
         // "selesai" tanpa sesi admin
         if (normalizedText === 'selesai') {
             await handleEndSession(client, sender)
             return
         }
-
+ 
         // ── Pencocokan FAQ (Knowledge Base) ─────────────────────────────────
-
+ 
         let bestEntry: any = null
         let bestScore = 0
-
+ 
         for (const [keyword, kb] of keywordIndex.entries()) {
             const score = matchKeyword(keyword, normalizedText, Config.typoThreshold)
             if (score > bestScore) {
@@ -270,19 +305,19 @@ export default {
                 bestEntry = kb
             }
         }
-
+ 
         if (!bestEntry || bestScore < Config.typoThreshold) {
             T.notFoundMessage(client, sender)
             return
         }
-
+ 
         try {
             await bestEntry.execute(client, sender)
         } catch (err) {
             console.error(`[Messages] Error execute knowledge base:`, err)
             T.notFoundMessage(client, sender)
         }
-
+ 
         T.moreQuestion(client, sender)
     },
 }
