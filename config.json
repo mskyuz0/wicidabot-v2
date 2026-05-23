@@ -13,8 +13,8 @@
     "admins": [
         {
             "id": "admin1",
-            "name": "Admin BAAK 1",
-            "jid": "6285157514800@s.whatsapp.net"
+            "name": "BAAK 1",
+            "jid": "62xxxxxxxx@s.whatsapp.net"
         }
     ],
     "adminNotifyPrefix": "ADMIN"
