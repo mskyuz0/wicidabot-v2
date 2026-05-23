@@ -53,6 +53,12 @@ export function antiGroupMessage(client: any, sender: string): void {
 
 // ─── Pesan Hubungi Admin ──────────────────────────────────────────────────────
 
+export async function searchingAdminMessage(client: any, sender: string): Promise<void> {
+    await client.sendMessage(sender, {
+        text: `🔍 Sedang mencari admin yang tersedia, mohon tunggu sebentar...`,
+    })
+}
+
 export function outsideWorkingHoursMessage(
     client: any,
     sender: string,
@@ -61,7 +67,7 @@ export function outsideWorkingHoursMessage(
     client.sendMessage(sender, {
         text:
             `⏰ *Di luar jam kerja*\n\n` +
-            `Maaf, fitur hubungi admin hanya tersedia pada:\n` +
+            `Maaf, fitur hubungi admin hanya tersedia pada:\n\n` +
             `📅 ${workingHoursInfo}\n\n` +
             `Di luar jam tersebut, kamu tetap bisa bertanya kepada saya dan ` +
             `pesanmu akan kami sampaikan saat jam kerja dimulai.`,
@@ -91,7 +97,7 @@ export function alreadyInQueueMessage(
     client.sendMessage(sender, {
         text:
             `🔔 Kamu sudah berada di antrian posisi *${position}*.\n` +
-            `Mohon bersabar, admin akan segera meladeni kamu.\n\n` +
+            `Mohon bersabar, admin akan segera membalas pesan kamu.\n\n` +
             `Ketik *batalkan* untuk membatalkan antrian.`,
     })
 }
@@ -154,8 +160,8 @@ export function notifyAdminNewChat(
             `🔔 *[WICIDA BOT - NOTIFIKASI]*\n\n` +
             `Halo *${adminName}*, ada mahasiswa yang ingin menghubungimu.\n\n` +
             `📱 Nomor: *+${userPhone}*\n\n` +
-            `Balas pesan ini untuk memulai percakapan, atau ketik *tolak* untuk menolak sesi ini.\n` +
-            `Ketik *selesai* untuk mengakhiri sesi saat percakapan selesai.`,
+            `Balas pesan ini untuk memulai percakapan, atau ketik *TOLAK* untuk menolak sesi ini.\n` +
+            `Ketik *SELESAI* untuk mengakhiri sesi saat percakapan selesai.`,
     })
 }
 
