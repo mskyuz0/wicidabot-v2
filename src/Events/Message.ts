@@ -3,6 +3,8 @@
  * Handler utama untuk semua pesan masuk.
  * Menangani:
  *  - Relay pesan antara user ↔ admin (sesi aktif)
+ *  - Sistem "terima dulu": bot broadcast ke semua admin, admin pertama yang
+ *    ketik "terima" akan terhubung — dilindungi mutex agar tidak tabrakan
  *  - Perintah khusus: "hubungi admin", "batalkan", "selesai"
  *  - Pencocokan FAQ berbasis keyword dengan toleransi typo
  */
@@ -16,19 +18,28 @@ import {
     initAdminQueue,
     isWorkingHours,
     getWorkingHoursInfo,
-    getAvailableAdmin,
+    getAvailableAdmins,
+    getAdminStatusByJid,
     addToQueue,
     removeFromQueue,
     getQueuePosition,
     isInQueue,
+    isInPending,
+    getPendingRequest,
+    getPendingUserByAdmin,
+    createPendingRequest,
+    cancelPendingRequest,
     isInAdminChat,
     getAdminChatByUser,
     getUserByAdminJid,
     startAdminChat,
-    acceptAdminChat,
-    isAdminChatAccepted,
     endAdminChat,
-    dequeueNext,
+    peekNextInQueue,
+    dequeueUser,
+    canonicalJid,
+    tryLockAccept,
+    unlockAccept,
+    PENDING_TIMEOUT_MS,
 } from '../Utils/adminQueue.js'
 import * as T from '../Utils/textFunction.js'
 
@@ -43,33 +54,53 @@ function normalizeText(text: string): string {
     return text.toLowerCase().normalize('NFKC').replace(/[^\w\s]/gi, ' ').replace(/\s+/g, ' ').trim()
 }
 
-/**
- * Normalisasi JID WhatsApp.
- *
- * Baileys kadang mengembalikan JID dengan device suffix, contoh:
- *   "628123456789:5@s.whatsapp.net"  (multi-device)
- *   "628123456789@s.whatsapp.net"    (standar)
- *
- * Fungsi ini menghapus bagian ":device_id" agar perbandingan selalu konsisten.
- */
 function normalizeJid(jid: string): string {
     return jid.replace(/:\d+@/, '@')
 }
 
-function extractNumber(jid: string): string {
-    return jid.split('@')[0].replace(/:\d+$/, '')
-}
-
-/** Cek apakah JID ini adalah salah satu admin yang terdaftar */
 function isAdminJid(jid: string): boolean {
     const norm = normalizeJid(jid)
     return (Config.admins as any[]).some((a: any) => normalizeJid(a.jid) === norm)
 }
 
-/** Cari AdminConfig berdasarkan JID */
 function getAdminConfigByJid(jid: string): any | null {
     const norm = normalizeJid(jid)
     return (Config.admins as any[]).find((a: any) => normalizeJid(a.jid) === norm) ?? null
+}
+
+// ─── Broadcast ke Admin ───────────────────────────────────────────────────────
+
+/**
+ * Broadcast notifikasi ke semua admin yang tidak sibuk.
+ * Buat pending request dengan timer timeout.
+ * Jika tidak ada admin tersedia → langsung masuk antrian.
+ */
+async function broadcastToAdmins(client: WASocket, userJid: string): Promise<void> {
+    const available = getAvailableAdmins()
+
+    if (available.length === 0) {
+        const pos = addToQueue(userJid)
+        T.addedToQueueMessage(client, userJid, pos, pos)
+        console.log(`[AdminQueue] ${userJid} masuk antrian posisi ${pos} (semua admin sibuk)`)
+        return
+    }
+
+    const timeoutMinutes = PENDING_TIMEOUT_MS / 1000 / 60
+    const notifiedJids: string[] = []
+
+    for (const admin of available) {
+        T.notifyAdminPendingRequest(client, admin.config.jid, userJid, admin.config.name, timeoutMinutes)
+        notifiedJids.push(admin.config.jid)
+    }
+
+    createPendingRequest(userJid, notifiedJids, () => {
+        // Timeout — tidak ada admin yang terima dalam 5 menit
+        console.log(`[AdminQueue] Timeout pending untuk ${userJid}`)
+        T.allAdminBusyMessage(client, userJid)
+    })
+
+    T.waitingForAdminMessage(client, userJid, timeoutMinutes)
+    console.log(`[AdminQueue] Broadcast ke ${notifiedJids.length} admin untuk user ${userJid}`)
 }
 
 // ─── Logika Hubungi Admin ─────────────────────────────────────────────────────
@@ -83,71 +114,151 @@ async function handleContactAdmin(client: WASocket, sender: string): Promise<voi
         T.alreadyInAdminChatMessage(client, sender)
         return
     }
+    if (isInPending(sender)) {
+        const pending = getPendingRequest(sender)!
+        const elapsed = Date.now() - pending.createdAt
+        const remaining = Math.ceil((PENDING_TIMEOUT_MS - elapsed) / 1000 / 60)
+        T.alreadyWaitingMessage(client, sender, remaining)
+        return
+    }
     if (isInQueue(sender)) {
         const pos = getQueuePosition(sender)
         T.alreadyInQueueMessage(client, sender, pos)
         return
     }
- 
-    // Kirim pesan "mencari admin..." terlebih dahulu
-    await T.searchingAdminMessage(client, sender)
- 
-    // Jeda 2 detik agar terasa natural
+
+    T.searchingAdminMessage(client, sender)
     await new Promise(resolve => setTimeout(resolve, 2000))
- 
-    const availableAdmin = getAvailableAdmin()
-    if (availableAdmin) {
-        startAdminChat(sender, availableAdmin)
-        T.adminConnectedToUserMessage(client, sender, availableAdmin.config.name)
-        T.notifyAdminNewChat(client, availableAdmin.config.jid, sender, availableAdmin.config.name)
-        console.log(`[AdminChat] ${sender} → ${availableAdmin.config.name}`)
-    } else {
-        const pos = addToQueue(sender)
-        T.addedToQueueMessage(client, sender, pos, pos)
-        console.log(`[AdminQueue] ${sender} masuk antrian posisi ${pos}`)
+    await broadcastToAdmins(client, sender)
+}
+
+// ─── Logika Admin Terima ──────────────────────────────────────────────────────
+
+/**
+ * Menangani ketika admin mengetik "terima".
+ *
+ * Dilindungi mutex (tryLockAccept) agar jika dua admin mengetik "terima"
+ * hampir bersamaan, hanya satu yang berhasil — yang lain dapat notif sudah diambil.
+ */
+async function handleAdminAccept(client: WASocket, adminJid: string, adminConfig: any): Promise<void> {
+    const userJid = getPendingUserByAdmin(adminJid)
+
+    if (!userJid) {
+        client.sendMessage(adminJid, {
+            text: `ℹ️ *[WICIDA BOT]*\n\nTidak ada permintaan yang menunggumu saat ini.`,
+        })
+        return
+    }
+
+    // ── Mutex: cegah dua admin "terima" bersamaan untuk user yang sama ──────
+    if (!tryLockAccept(userJid)) {
+        // Admin lain sedang dalam proses accept untuk user ini
+        client.sendMessage(adminJid, {
+            text: `ℹ️ *[WICIDA BOT]*\n\nPermintaan mahasiswa ini sedang diproses oleh admin lain.`,
+        })
+        return
+    }
+
+    try {
+        // Double-check: pastikan pending masih ada setelah lock berhasil
+        // (bisa saja sudah di-cancel oleh timeout atau admin lain)
+        const pending = getPendingRequest(userJid)
+        if (!pending) {
+            client.sendMessage(adminJid, {
+                text: `ℹ️ *[WICIDA BOT]*\n\nPermintaan mahasiswa ini sudah tidak tersedia (mungkin sudah diterima admin lain atau dibatalkan).`,
+            })
+            return
+        }
+
+        const adminStatus = getAdminStatusByJid(adminJid)
+        if (!adminStatus) return
+
+        // Batalkan pending (clear timeout + hapus reverse lookup)
+        cancelPendingRequest(userJid)
+
+        // Mulai sesi
+        startAdminChat(userJid, adminStatus)
+
+        // Beritahu admin lain yang juga dapat notifikasi
+        for (const otherJid of pending.notifiedAdminJids) {
+            if (canonicalJid(otherJid) !== canonicalJid(adminJid)) {
+                T.notifyAdminRequestTaken(client, otherJid, adminConfig.name)
+            }
+        }
+
+        // Beritahu user
+        T.adminConnectedToUserMessage(client, userJid, adminConfig.name)
+
+        // Beritahu admin yang terima
+        client.sendMessage(adminJid, {
+            text:
+                `✅ *[WICIDA BOT]*\n\n` +
+                `Kamu berhasil terhubung dengan mahasiswa.\n` +
+                `Silakan mulai percakapan. Ketik *selesai* jika sudah selesai.`,
+        })
+
+        console.log(`[AdminChat] ${userJid} → ${adminConfig.name} (terima)`)
+    } finally {
+        // Selalu lepas lock meskipun terjadi error
+        unlockAccept(userJid)
     }
 }
 
-/** Tangani perintah "selesai" dari user atau admin */
+// ─── Logika Akhiri Sesi ───────────────────────────────────────────────────────
+
 async function handleEndSession(client: WASocket, sender: string): Promise<void> {
-    const normalizedSender = normalizeJid(sender)
- 
-    if (isAdminJid(normalizedSender)) {
-        const userJid = getUserByAdminJid(normalizedSender)
+    if (isAdminJid(sender)) {
+        const userJid = getUserByAdminJid(sender)
         if (!userJid) {
             client.sendMessage(sender, { text: `ℹ️ Tidak ada sesi aktif yang bisa diakhiri.` })
             return
         }
         endAdminChat(userJid)
-        // Akhiri sesi bot user sekaligus
         clearSession(userJid)
         T.adminChatEndedUserMessage(client, userJid)
         T.notifyAdminChatEnded(client, sender, userJid)
         processNextQueue(client)
         return
     }
- 
+
     const session = getAdminChatByUser(sender)
     if (!session) {
         client.sendMessage(sender, { text: `Kamu tidak sedang dalam sesi chat dengan admin.` })
         return
     }
     endAdminChat(sender)
-    // Akhiri sesi bot user sekaligus
     clearSession(sender)
     T.adminChatEndedUserMessage(client, sender)
     T.notifyAdminChatEnded(client, session.adminJid, sender)
     processNextQueue(client)
 }
 
-/** Proses antrian berikutnya setelah sesi berakhir */
+// ─── Proses Antrian Berikutnya ────────────────────────────────────────────────
+
 function processNextQueue(client: WASocket): void {
-    const next = dequeueNext()
+    const next = peekNextInQueue()
     if (!next) return
-    const { entry, admin } = next
-    T.adminConnectedToUserMessage(client, entry.userJid, admin.config.name)
-    T.notifyAdminFromQueue(client, admin.config.jid, entry.userJid, admin.config.name, 1)
-    console.log(`[AdminQueue] Antrian diproses: ${entry.userJid} → ${admin.config.name}`)
+
+    const available = getAvailableAdmins()
+    if (available.length === 0) return
+
+    dequeueUser(next.userJid)
+
+    const timeoutMinutes = PENDING_TIMEOUT_MS / 1000 / 60
+    const notifiedJids: string[] = []
+
+    for (const admin of available) {
+        T.notifyAdminPendingRequest(client, admin.config.jid, next.userJid, admin.config.name, timeoutMinutes)
+        notifiedJids.push(admin.config.jid)
+    }
+
+    createPendingRequest(next.userJid, notifiedJids, () => {
+        console.log(`[AdminQueue] Timeout antrian pending untuk ${next.userJid}`)
+        T.allAdminBusyMessage(client, next.userJid)
+    })
+
+    T.waitingForAdminMessage(client, next.userJid, timeoutMinutes)
+    console.log(`[AdminQueue] Antrian diproses: ${next.userJid}, broadcast ke ${notifiedJids.length} admin`)
 }
 
 // ─── Handler Utama ────────────────────────────────────────────────────────────
@@ -181,91 +292,109 @@ export default {
 
         // ═══════════════════════════════════════════════════════════════════
         // BLOK 1: Pengirim adalah Admin
-        // Harus dicek PERTAMA sebelum apapun, agar admin tidak masuk
-        // ke flow "user baru" dan tidak mendapat welcome message.
+        // Dicek PERTAMA agar admin tidak masuk flow "user baru"
         // ═══════════════════════════════════════════════════════════════════
         if (isAdminJid(normalizedSender)) {
             const adminConfig = getAdminConfigByJid(normalizedSender)
+            if (!adminConfig) return
+
             const userJid = getUserByAdminJid(normalizedSender)
- 
-            console.log(`[Admin] Pesan dari ${adminConfig?.name ?? normalizedSender}, sesi user: ${userJid ?? '-'}`)
- 
-            if (!adminConfig) return  // config tidak ditemukan, abaikan
- 
-            // Admin tidak sedang menangani siapapun
-            if (!userJid) {
-                client.sendMessage(sender, {
-                    text:
-                        `ℹ️ *[WICIDA BOT]*\n\n` +
-                        `Halo ${adminConfig.name}, kamu tidak sedang menangani sesi apapun saat ini.\n` +
-                        `Bot akan menghubungimu otomatis saat ada mahasiswa yang membutuhkan bantuan.`,
-                })
-                return
-            }
- 
-            // Admin sedang menangani user — cek perintah
-            if (normalizedText === 'selesai') {
-                await handleEndSession(client, sender)
-                return
-            }
-            if (normalizedText === 'tolak') {
-                // Hanya bisa tolak jika sesi belum diterima (admin belum balas pertama kali)
-                if (isAdminChatAccepted(userJid)) {
-                    client.sendMessage(sender, {
-                        text: `⚠️ Tidak bisa menolak sesi yang sudah berjalan.
-Ketik *selesai* untuk mengakhiri sesi.`,
-                    })
+            const pendingUserJid = getPendingUserByAdmin(normalizedSender)
+
+            console.log(`[Admin] ${adminConfig.name} | sesi: ${userJid ?? '-'} | pending: ${pendingUserJid ?? '-'} | pesan: "${normalizedText}"`)
+
+            // ── Admin sedang dalam sesi aktif ────────────────────────────────
+            if (userJid) {
+                if (normalizedText === 'selesai') {
+                    await handleEndSession(client, sender)
                     return
                 }
-                endAdminChat(userJid)
-                clearSession(userJid)
-                client.sendMessage(userJid, {
-                    text: `Maaf, admin tidak bisa meladeni kamu saat ini. Ketik *hubungi admin* untuk masuk antrian kembali.`,
-                })
-                client.sendMessage(sender, { text: `✅ Sesi ditolak. Kamu kini tersedia kembali.` })
-                processNextQueue(client)
+                // Relay pesan ke user
+                T.relayToUser(client, userJid, adminConfig.name, rawText)
                 return
             }
- 
-            // Pesan pertama dari admin = tanda sesi diterima
-            if (!isAdminChatAccepted(userJid)) {
-                acceptAdminChat(userJid)
+
+            // ── Admin ada pending user (menunggu terima/tolak) ───────────────
+            if (pendingUserJid) {
+                if (normalizedText === 'terima') {
+                    await handleAdminAccept(client, normalizedSender, adminConfig)
+                    return
+                }
+                if (normalizedText === 'tolak') {
+                    cancelPendingRequest(pendingUserJid)
+
+                    client.sendMessage(sender, { text: `✅ Permintaan ditolak. Kamu kini tidak terdaftar untuk user tersebut.` })
+
+                    // Coba broadcast ulang ke admin lain yang tersedia
+                    const others = getAvailableAdmins().filter(
+                        a => canonicalJid(a.config.jid) !== canonicalJid(normalizedSender)
+                    )
+                    if (others.length > 0) {
+                        const timeoutMinutes = PENDING_TIMEOUT_MS / 1000 / 60
+                        const notifiedJids: string[] = []
+                        for (const admin of others) {
+                            T.notifyAdminPendingRequest(client, admin.config.jid, pendingUserJid, admin.config.name, timeoutMinutes)
+                            notifiedJids.push(admin.config.jid)
+                        }
+                        createPendingRequest(pendingUserJid, notifiedJids, () => {
+                            T.allAdminBusyMessage(client, pendingUserJid)
+                        })
+                    } else {
+                        // Tidak ada admin lain → masuk antrian
+                        const pos = addToQueue(pendingUserJid)
+                        T.addedToQueueMessage(client, pendingUserJid, pos, pos)
+                    }
+                    return
+                }
+                // Admin kirim pesan lain saat ada pending → ingatkan
+                client.sendMessage(sender, {
+                    text:
+                        `💡 *[WICIDA BOT]*\n\n` +
+                        `Ada mahasiswa yang menunggumu.\n` +
+                        `Ketik *terima* untuk menerima atau *tolak* untuk menolak.`,
+                })
+                return
             }
- 
-            // Relay pesan admin → user
-            T.relayToUser(client, userJid, adminConfig.name, rawText)
+
+            // ── Admin tidak ada sesi maupun pending ──────────────────────────
+            client.sendMessage(sender, {
+                text:
+                    `ℹ️ *[WICIDA BOT]*\n\n` +
+                    `Halo ${adminConfig.name}, kamu tidak sedang menangani sesi apapun saat ini.\n` +
+                    `Bot akan menghubungimu otomatis saat ada mahasiswa yang membutuhkan bantuan.`,
+            })
             return
         }
- 
+
         // ═══════════════════════════════════════════════════════════════════
         // BLOK 2: Pengirim adalah User
         // ═══════════════════════════════════════════════════════════════════
- 
-        // Inisialisasi sesi baru untuk user yang belum pernah chat
+
+        // Inisialisasi sesi baru
         if (!userSessions[sender]) {
             userSessions[sender] = { active: true }
             T.welcomeMessage(client, sender)
             resetTimeout(sender, client)
             return
         }
- 
+
         resetTimeout(sender, client)
- 
+
         // User sedang dalam sesi chat dengan admin → relay
         if (isInAdminChat(sender)) {
-            const session = getAdminChatByUser(sender)!
             if (normalizedText === 'selesai') {
                 await handleEndSession(client, sender)
                 return
             }
+            const session = getAdminChatByUser(sender)!
             T.relayToAdmin(client, session.adminJid, sender, rawText)
             return
         }
- 
-        // ── Perintah Khusus User ────────────────────────────────────────────
- 
+
+        // ── Perintah Khusus User ─────────────────────────────────────────────
+
         // "hubungi admin"
-        const contactAdminPatterns = ['hubungi admin', 'admin baak', 'tanya admin', 'bicara admin', 'chat admin']
+        const contactAdminPatterns = ['hubungi admin', 'admin baak', 'tanya admin', 'bicara admin', 'chat admin', 'admin']
         const wantAdmin =
             contactAdminPatterns.some(p => normalizedText.includes(p)) ||
             matchKeyword('hubungi admin', normalizedText, 0.75) > 0
@@ -273,12 +402,15 @@ Ketik *selesai* untuk mengakhiri sesi.`,
             await handleContactAdmin(client, sender)
             return
         }
- 
-        // "batalkan antrian"
+
+        // "batalkan" — berlaku untuk pending maupun antrian
         const cancelPatterns = ['batalkan', 'batal antrian', 'cancel antrian', 'keluar antrian']
         const wantCancel = cancelPatterns.some(p => normalizedText.includes(p))
         if (wantCancel) {
-            if (isInQueue(sender)) {
+            if (isInPending(sender)) {
+                cancelPendingRequest(sender)
+                T.pendingCancelledMessage(client, sender)
+            } else if (isInQueue(sender)) {
                 removeFromQueue(sender)
                 T.queueCancelledMessage(client, sender)
             } else {
@@ -286,18 +418,18 @@ Ketik *selesai* untuk mengakhiri sesi.`,
             }
             return
         }
- 
+
         // "selesai" tanpa sesi admin
         if (normalizedText === 'selesai') {
             await handleEndSession(client, sender)
             return
         }
- 
-        // ── Pencocokan FAQ (Knowledge Base) ─────────────────────────────────
- 
+
+        // ── Pencocokan FAQ (Knowledge Base) ──────────────────────────────────
+
         let bestEntry: any = null
         let bestScore = 0
- 
+
         for (const [keyword, kb] of keywordIndex.entries()) {
             const score = matchKeyword(keyword, normalizedText, Config.typoThreshold)
             if (score > bestScore) {
@@ -305,19 +437,19 @@ Ketik *selesai* untuk mengakhiri sesi.`,
                 bestEntry = kb
             }
         }
- 
+
         if (!bestEntry || bestScore < Config.typoThreshold) {
             T.notFoundMessage(client, sender)
             return
         }
- 
+
         try {
             await bestEntry.execute(client, sender)
         } catch (err) {
             console.error(`[Messages] Error execute knowledge base:`, err)
             T.notFoundMessage(client, sender)
         }
- 
+
         T.moreQuestion(client, sender)
     },
 }
