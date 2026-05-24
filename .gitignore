@@ -1,3 +1,4 @@
 dist/
 session/
 node_modules/
+config.json
