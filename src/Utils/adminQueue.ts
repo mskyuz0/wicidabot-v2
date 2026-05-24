@@ -1,10 +1,39 @@
 /**
  * adminQueue.ts
- * Mengelola antrian pengguna yang ingin dihubungkan ke admin,
- * status ketersediaan admin, dan sesi chat admin-user.
+ * Mengelola antrian pengguna, status admin, dan sesi chat admin-user.
+ *
+ * Alur baru "terima dulu":
+ *  1. User minta hubungi admin
+ *  2. Bot broadcast notifikasi ke SEMUA admin yang tidak sibuk
+ *  3. Admin pertama yang balas "terima" → terhubung dengan user
+ *  4. Admin lain yang balas "terima" → diberi tahu sudah diambil admin lain
+ *  5. Jika tidak ada admin yang terima dalam PENDING_TIMEOUT ms → bot info ke user
  */
 
 import Config from '../../config.json' with { type: 'json' }
+
+// ─── Konstanta ────────────────────────────────────────────────────────────────
+
+export const PENDING_TIMEOUT_MS = 5 * 60 * 1000  // 5 menit
+
+// ─── Mutex (mencegah race condition "terima" bersamaan) ───────────────────────
+// Node.js single-threaded, tapi event loop bisa interleave async calls.
+// Set ini menyimpan userJid yang sedang dalam proses accept,
+// sehingga jika dua admin "terima" hampir bersamaan, hanya yang pertama yang jalan.
+
+const acceptLocks = new Set<string>()
+
+/** Coba kunci proses accept untuk userJid. Return false jika sudah dikunci. */
+export function tryLockAccept(userJid: string): boolean {
+    if (acceptLocks.has(userJid)) return false
+    acceptLocks.add(userJid)
+    return true
+}
+
+/** Lepaskan kunci accept untuk userJid. */
+export function unlockAccept(userJid: string): void {
+    acceptLocks.delete(userJid)
+}
 
 // ─── Tipe Data ───────────────────────────────────────────────────────────────
 
@@ -13,44 +42,52 @@ export interface AdminConfig {
     name: string
     jid: string
 }
- 
+
 export interface AdminStatus {
     config: AdminConfig
     isBusy: boolean
-    currentUser: string | null   // JID user yang sedang dilayani
+    currentUser: string | null
     busySince: number | null
 }
- 
+
 export interface QueueEntry {
     userJid: string
     requestedAt: number
-    notified: boolean            // sudah diberitahu posisi antrian?
+    notified: boolean
 }
- 
+
 export interface ActiveAdminChat {
     userJid: string
     adminJid: string
     adminId: string
     startedAt: number
-    accepted: boolean   // false = notifikasi sudah dikirim, menunggu admin balas pertama
 }
- 
+
+/**
+ * PendingRequest — user sudah minta hubungi admin,
+ * notifikasi sudah disebar ke semua admin, menunggu salah satu menerima.
+ */
+export interface PendingRequest {
+    userJid: string
+    createdAt: number
+    timeoutHandle: NodeJS.Timeout
+    notifiedAdminJids: string[]   // admin yang sudah dapat notifikasi
+}
+
 // ─── State ───────────────────────────────────────────────────────────────────
- 
-// Status setiap admin
+
 const adminStatusMap = new Map<string, AdminStatus>()
- 
-// Antrian user yang menunggu
 const queue: QueueEntry[] = []
- 
-// Sesi chat yang sedang aktif (user ↔ admin)
-const activeSessions = new Map<string, ActiveAdminChat>()  // key = userJid
-// Key Map selalu pakai format canonical: "628xxx@s.whatsapp.net"
-// agar cocok meski Baileys kirim JID dengan @lid atau device suffix
-const adminToUser = new Map<string, string>()              // adminJid (canonical) → userJid
- 
+const activeSessions = new Map<string, ActiveAdminChat>()   // key = userJid
+const adminToUser = new Map<string, string>()                // adminJid canonical → userJid
+
+// Pending requests: user yang menunggu admin terima
+const pendingRequests = new Map<string, PendingRequest>()   // key = userJid
+// Reverse lookup: admin yang sudah mendapat notifikasi → userJid yang ditunggu
+const adminPendingUser = new Map<string, string>()           // adminJid canonical → userJid
+
 // ─── Inisialisasi ─────────────────────────────────────────────────────────────
- 
+
 export function initAdminQueue(): void {
     for (const admin of Config.admins as AdminConfig[]) {
         adminStatusMap.set(admin.id, {
@@ -62,53 +99,46 @@ export function initAdminQueue(): void {
     }
     console.log(`[AdminQueue] Inisialisasi dengan ${Config.admins.length} admin.`)
 }
- 
+
 // ─── Jam Kerja ────────────────────────────────────────────────────────────────
- 
+
 export function isWorkingHours(): boolean {
     const now = new Date()
-    const day = now.getDay()       // 0 = Minggu, 1–5 = Senin–Jumat, 6 = Sabtu
-    const hour = now.getHours()
-    const minute = now.getMinutes()
-    const timeInMinutes = hour * 60 + minute
- 
+    const day = now.getDay()
+    const timeInMinutes = now.getHours() * 60 + now.getMinutes()
+
     const wh = Config.workingHours
-    const workDays: number[] = wh.workDays
- 
-    if (!workDays.includes(day)) return false
- 
+    if (!(wh.workDays as number[]).includes(day)) return false
+
     const start = wh.start * 60
     const end = wh.end * 60
     const breakStart = wh.breakStart * 60
     const breakEnd = wh.breakEnd * 60
- 
+
     if (timeInMinutes < start || timeInMinutes >= end) return false
     if (timeInMinutes >= breakStart && timeInMinutes < breakEnd) return false
- 
     return true
 }
- 
+
 export function getWorkingHoursInfo(): string {
     const wh = Config.workingHours
     return (
-        `Senin – Jumat, pukul ${wh.start}.00–${wh.breakStart}.00 dan ${wh.breakEnd}.00–${wh.end}.00 WIB` +
-        ` (istirahat ${wh.breakStart}.00–${wh.breakEnd}.00)`
+        `Senin – Jumat, pukul ${wh.start}.00–${wh.breakStart}.00 ` +
+        `dan ${wh.breakEnd}.00–${wh.end}.00 WIB ` +
+        `(istirahat ${wh.breakStart}.00–${wh.breakEnd}.00)`
     )
 }
- 
+
 // ─── Manajemen Admin ──────────────────────────────────────────────────────────
- 
-export function getAvailableAdmin(): AdminStatus | null {
-    for (const status of adminStatusMap.values()) {
-        if (!status.isBusy) return status
-    }
-    return null
+
+export function getAvailableAdmins(): AdminStatus[] {
+    return Array.from(adminStatusMap.values()).filter(s => !s.isBusy)
 }
- 
+
 export function getAllAdminStatus(): AdminStatus[] {
     return Array.from(adminStatusMap.values())
 }
- 
+
 export function setAdminBusy(adminId: string, userJid: string): void {
     const status = adminStatusMap.get(adminId)
     if (!status) return
@@ -116,7 +146,7 @@ export function setAdminBusy(adminId: string, userJid: string): void {
     status.currentUser = userJid
     status.busySince = Date.now()
 }
- 
+
 export function setAdminFree(adminId: string): void {
     const status = adminStatusMap.get(adminId)
     if (!status) return
@@ -124,112 +154,157 @@ export function setAdminFree(adminId: string): void {
     status.currentUser = null
     status.busySince = null
 }
- 
-// ─── Manajemen Antrian ────────────────────────────────────────────────────────
- 
-export function addToQueue(userJid: string): number {
-    // Hindari duplikat
-    if (queue.some(e => e.userJid === userJid)) {
-        return getQueuePosition(userJid)
-    }
-    queue.push({ userJid, requestedAt: Date.now(), notified: false })
-    return queue.length  // posisi (1-based)
+
+// ─── JID Canonical ───────────────────────────────────────────────────────────
+
+export function canonicalJid(jid: string): string {
+    return jid.split('@')[0].replace(/:\d+$/, '') + '@s.whatsapp.net'
 }
- 
+
+// ─── Manajemen Pending Request ────────────────────────────────────────────────
+
+/**
+ * Buat pending request untuk user.
+ * Callback onTimeout dipanggil jika tidak ada admin yang terima dalam PENDING_TIMEOUT_MS.
+ */
+export function createPendingRequest(
+    userJid: string,
+    notifiedAdminJids: string[],
+    onTimeout: () => void
+): PendingRequest {
+    // Hapus pending lama jika ada
+    cancelPendingRequest(userJid)
+
+    const timeoutHandle = setTimeout(onTimeout, PENDING_TIMEOUT_MS)
+    const pending: PendingRequest = {
+        userJid,
+        createdAt: Date.now(),
+        timeoutHandle,
+        notifiedAdminJids,
+    }
+    pendingRequests.set(userJid, pending)
+
+    // Daftarkan reverse lookup untuk setiap admin yang dinotifikasi
+    for (const adminJid of notifiedAdminJids) {
+        adminPendingUser.set(canonicalJid(adminJid), userJid)
+    }
+
+    return pending
+}
+
+/** Batalkan pending request (timeout di-clear, data dihapus) */
+export function cancelPendingRequest(userJid: string): void {
+    const pending = pendingRequests.get(userJid)
+    if (!pending) return
+    clearTimeout(pending.timeoutHandle)
+    for (const adminJid of pending.notifiedAdminJids) {
+        adminPendingUser.delete(canonicalJid(adminJid))
+    }
+    pendingRequests.delete(userJid)
+}
+
+export function getPendingRequest(userJid: string): PendingRequest | null {
+    return pendingRequests.get(userJid) ?? null
+}
+
+export function isInPending(userJid: string): boolean {
+    return pendingRequests.has(userJid)
+}
+
+/** Cek apakah admin ini memiliki pending user yang menunggu diterima */
+export function getPendingUserByAdmin(adminJid: string): string | null {
+    return adminPendingUser.get(canonicalJid(adminJid)) ?? null
+}
+
+// ─── Manajemen Antrian ────────────────────────────────────────────────────────
+
+export function addToQueue(userJid: string): number {
+    if (queue.some(e => e.userJid === userJid)) return getQueuePosition(userJid)
+    queue.push({ userJid, requestedAt: Date.now(), notified: false })
+    return queue.length
+}
+
 export function removeFromQueue(userJid: string): void {
     const idx = queue.findIndex(e => e.userJid === userJid)
     if (idx !== -1) queue.splice(idx, 1)
 }
- 
+
 export function getQueuePosition(userJid: string): number {
     const idx = queue.findIndex(e => e.userJid === userJid)
     return idx === -1 ? -1 : idx + 1
 }
- 
+
 export function getQueueLength(): number {
     return queue.length
 }
- 
+
 export function getNextInQueue(): QueueEntry | null {
     return queue[0] ?? null
 }
- 
+
 export function isInQueue(userJid: string): boolean {
     return queue.some(e => e.userJid === userJid)
 }
- 
+
 // ─── Manajemen Sesi Chat Admin-User ───────────────────────────────────────────
- 
-// Canonical key: ambil nomor saja (bagian sebelum "@") + "@s.whatsapp.net"
-// Ini agar Map selalu cocok meski Baileys kirim JID dengan @lid atau device suffix
-function canonicalAdminJid(jid: string): string {
-    return jid.split('@')[0].replace(/:\d+$/, '') + '@s.whatsapp.net'
-}
- 
-export function startAdminChat(
-    userJid: string,
-    adminStatus: AdminStatus
-): void {
-    const canonicalJid = canonicalAdminJid(adminStatus.config.jid)
+
+export function startAdminChat(userJid: string, adminStatus: AdminStatus): void {
+    const cJid = canonicalJid(adminStatus.config.jid)
     const session: ActiveAdminChat = {
         userJid,
-        adminJid: canonicalJid,
+        adminJid: cJid,
         adminId: adminStatus.config.id,
         startedAt: Date.now(),
-        accepted: false,  // menunggu admin balas pertama kali
     }
     activeSessions.set(userJid, session)
-    adminToUser.set(canonicalJid, userJid)
+    adminToUser.set(cJid, userJid)
     setAdminBusy(adminStatus.config.id, userJid)
 }
- 
-/** Tandai sesi sebagai sudah diterima admin (admin sudah balas pertama kali) */
-export function acceptAdminChat(userJid: string): void {
-    const session = activeSessions.get(userJid)
-    if (session) session.accepted = true
-}
- 
-/** Cek apakah sesi sudah diterima admin */
-export function isAdminChatAccepted(userJid: string): boolean {
-    return activeSessions.get(userJid)?.accepted ?? false
-}
- 
+
 export function endAdminChat(userJid: string): AdminStatus | null {
     const session = activeSessions.get(userJid)
     if (!session) return null
- 
     activeSessions.delete(userJid)
     adminToUser.delete(session.adminJid)
     setAdminFree(session.adminId)
- 
     return adminStatusMap.get(session.adminId) ?? null
 }
- 
+
 export function getAdminChatByUser(userJid: string): ActiveAdminChat | null {
     return activeSessions.get(userJid) ?? null
 }
- 
+
 export function getUserByAdminJid(adminJid: string): string | null {
-    // Normalisasi JID yang masuk sebelum lookup ke Map
-    return adminToUser.get(canonicalAdminJid(adminJid)) ?? null
+    return adminToUser.get(canonicalJid(adminJid)) ?? null
 }
- 
+
 export function isInAdminChat(userJid: string): boolean {
     return activeSessions.has(userJid)
 }
- 
+
+export function getAdminStatusById(adminId: string): AdminStatus | null {
+    return adminStatusMap.get(adminId) ?? null
+}
+
+export function getAdminStatusByJid(adminJid: string): AdminStatus | null {
+    const cJid = canonicalJid(adminJid)
+    for (const status of adminStatusMap.values()) {
+        if (canonicalJid(status.config.jid) === cJid) return status
+    }
+    return null
+}
+
 // ─── Proses Antrian Berikutnya ────────────────────────────────────────────────
-// Dipanggil setelah sesi chat selesai untuk melayani user berikutnya
- 
-export function dequeueNext(): { entry: QueueEntry; admin: AdminStatus } | null {
-    const nextEntry = getNextInQueue()
-    if (!nextEntry) return null
- 
-    const admin = getAvailableAdmin()
-    if (!admin) return null
- 
-    removeFromQueue(nextEntry.userJid)
-    startAdminChat(nextEntry.userJid, admin)
- 
-    return { entry: nextEntry, admin }
+
+/**
+ * Dipanggil setelah sesi selesai.
+ * Mengembalikan entry antrian berikutnya (tanpa langsung start chat),
+ * agar Messages.ts bisa broadcast notifikasi ke admin terlebih dahulu.
+ */
+export function peekNextInQueue(): QueueEntry | null {
+    return queue[0] ?? null
+}
+
+export function dequeueUser(userJid: string): void {
+    removeFromQueue(userJid)
 }
