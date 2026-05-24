@@ -4,13 +4,14 @@
  */
 
 import { AdminConfig } from './adminQueue.js'
+import Config from '../../config.json' with { type: 'json' }
 
 // ─── Pesan Umum Bot ───────────────────────────────────────────────────────────
 
 export function welcomeMessage(client: any, sender: string): void {
     client.sendMessage(sender, {
         text:
-            `Hai! 👋 Selamat datang di *WhatsApp Wicida Support*.\n\n` +
+            `Hai! 👋 Selamat datang di *WhatsApp ${Config.botName}*.\n\n` +
             `Saya siap membantu menjawab pertanyaan seputar akademik. ` +
             `Silakan ketik pertanyaanmu secara langsung, misalnya:\n` +
             `_"Apakah saya bisa mencetak KRS?"_\n\n` +
@@ -23,7 +24,7 @@ export function closingMessage(client: any, sender: string): void {
         text: `Karena tidak ada respon, kami mengakhiri sesi chat ini. Jangan khawatir, kamu bisa memulai percakapan baru kapan saja. 😊`,
     })
     client.sendMessage(sender, {
-        text: `Terima kasih sudah menghubungi *WhatsApp Wicida Support*. Semoga harimu menyenangkan! 🙏`,
+        text: `Terima kasih sudah menghubungi *WhatsApp ${Config.botName}*. Semoga harimu menyenangkan! 🙏`,
     })
 }
 
@@ -140,12 +141,90 @@ export function adminChatEndedUserMessage(client: any, sender: string): void {
     client.sendMessage(sender, {
         text:
             `👋 Sesi chat dengan admin telah berakhir.\n\n` +
-            `Terima kasih sudah menghubungi *WhatsApp Wicida Support*! ` +
+            `Terima kasih sudah menghubungi *WhatsApp ${Config.botName}*! ` +
             `Jika ada pertanyaan lain, jangan ragu untuk menghubungi kami kembali. 🙏`,
     })
 }
 
 // ─── Pesan untuk Admin ────────────────────────────────────────────────────────
+
+// Notifikasi ke semua admin tersedia (sistem terima dulu)
+export function notifyAdminPendingRequest(
+    client: any,
+    adminJid: string,
+    userJid: string,
+    adminName: string,
+    timeoutMinutes: number
+): void {
+    const userPhone = userJid.split('@')[0]
+    client.sendMessage(adminJid, {
+        text:
+            `🔔 *[WICIDA BOT - PERMINTAAN BARU]*\n\n` +
+            `Halo *${adminName}*, ada mahasiswa yang ingin menghubungi admin.\n\n` +
+            `📱 Nomor: *+${userPhone}*\n\n` +
+            `Ketik *terima* untuk menerima sesi ini.\n` +
+            `Ketik *tolak* jika kamu tidak bisa melayani sekarang.\n\n` +
+            `⏰ Permintaan ini akan kedaluwarsa dalam *${timeoutMinutes} menit*.`,
+    })
+}
+
+// Notifikasi ke admin lain bahwa request sudah diambil admin lain
+export function notifyAdminRequestTaken(
+    client: any,
+    adminJid: string,
+    takenByName: string
+): void {
+    client.sendMessage(adminJid, {
+        text:
+            `ℹ️ *[WICIDA BOT]*\n\n` +
+            `Permintaan mahasiswa tadi sudah diterima oleh *${takenByName}*.\n` +
+            `Tidak ada tindakan yang diperlukan.`,
+    })
+}
+
+/** Dikirim ke user saat semua admin tidak merespons dalam timeout */
+export function allAdminBusyMessage(client: any, sender: string): void {
+    client.sendMessage(sender, {
+        text:
+            `😔 Maaf, semua admin sedang tidak bisa melayani saat ini.
+ 
+` +
+            `Kamu bisa:
+` +
+            `• Coba lagi nanti dengan ketik *hubungi admin*
+` +
+            `• Atau ajukan pertanyaanmu langsung ke saya`,
+    })
+}
+
+/** Dikirim ke user saat notifikasi sudah disebar ke admin, menunggu konfirmasi */
+export function waitingForAdminMessage(client: any, sender: string, timeoutMinutes: number): void {
+    client.sendMessage(sender, {
+        text:
+            `📨 Permintaanmu sudah dikirim ke admin yang tersedia.
+ 
+` +
+            `Mohon tunggu, admin akan mengkonfirmasi dalam *${timeoutMinutes} menit* ke depan.
+` +
+            `Ketik *batalkan* jika ingin membatalkan.`,
+    })
+}
+
+export function pendingCancelledMessage(client: any, sender: string): void {
+    client.sendMessage(sender, {
+        text: `✅ Permintaan hubungi admin telah dibatalkan. Ketik *hubungi admin* kapan saja jika butuh bantuan.`,
+    })
+}
+
+/** Dikirim ke user saat mereka sudah dalam status pending dan kirim "hubungi admin" lagi */
+export function alreadyWaitingMessage(client: any, sender: string, remainingMinutes: number): void {
+    client.sendMessage(sender, {
+        text:
+            `⏳ Permintaanmu masih menunggu konfirmasi admin (*${remainingMinutes} menit* tersisa).
+` +
+            `Ketik *batalkan* jika ingin membatalkan.`,
+    })
+}
 
 // Notifikasi ke admin bahwa ada user yang menghubungi
 export function notifyAdminNewChat(
@@ -178,6 +257,7 @@ export function notifyAdminChatEnded(
             `Kamu sekarang tersedia untuk melayani pengguna lain.`,
     })
 }
+
 
 // Relay pesan dari user ke admin (dengan label)
 export function relayToAdmin(
